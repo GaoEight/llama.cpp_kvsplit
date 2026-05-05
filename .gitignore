@@ -157,3 +157,5 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+models/llama-3.2-1B.gguf
+.devcontainer

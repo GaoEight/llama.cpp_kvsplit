@@ -477,6 +477,13 @@ struct common_params {
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
+    // KMeans configuration
+    std::string kmeans_config_path;
+    bool        kmeans_enabled      = false;
+    int32_t     kmeans_max_iter     = 20;
+    int32_t     kmeans_cluster_div  = 80;
+    int32_t     kmeans_sink_len     = 4;
+
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
 
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO

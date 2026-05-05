@@ -336,6 +336,10 @@ extern "C" {
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
+        int32_t  kmeans_max_iter;     // KMeans max iterations (0 = disabled)
+        int32_t  kmeans_cluster_div;  // KMeans cluster divisor: n_clusters = n_tokens // cluster_div (0 = disabled)
+        int32_t  kmeans_sink_len;     // KMeans sink token length
+
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
@@ -374,6 +378,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool kmeans_enabled; // enable KMeans clustering on KV cache
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

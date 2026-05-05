@@ -7277,6 +7277,67 @@ struct test_falcon : public test_llm {
 };
 
 
+// --------------------------------------------------------------------------
+// test_kmeans — KMeans clustering on K cache
+// --------------------------------------------------------------------------
+// 验证目标:
+//   1. 内存安全: sentinel 检测内存越界
+//   2. 数值稳定性: 无 NaN/Inf
+//   3. 多线程安全: ith/nth strip 无 race condition
+//   4. 输出一致性: assignments (I32) 和 centroids (F16) bit-exact
+struct test_kmeans : public test_case {
+    const ggml_type type;        // k_cache 类型: F16 / BF16
+    const int d_head;
+    const int n_heads;
+    const int n_tokens;
+    const int n_clusters;
+    const int max_iter;
+    const int sink_len;
+
+    ggml_tensor * centroids_buf = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, d_head, n_heads, n_tokens, n_clusters, max_iter, sink_len);
+    }
+
+    test_kmeans(ggml_type type, int d_head, int n_heads, int n_tokens,
+                int n_clusters, int max_iter, int sink_len)
+        : type(type), d_head(d_head), n_heads(n_heads), n_tokens(n_tokens),
+          n_clusters(n_clusters), max_iter(max_iter), sink_len(sink_len) {}
+
+    // bit-exact: 两个后端执行相同代码，输出必须完全一致
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, type, d_head, n_heads, n_tokens);
+        ggml_set_name(k_cache, "k_cache");
+
+        centroids_buf = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_head, n_heads, n_clusters);
+        ggml_set_name(centroids_buf, "centroids_buf");
+
+        ggml_tensor * out = ggml_kmeans(ctx, k_cache, centroids_buf,
+                                        n_clusters, max_iter, sink_len);
+        ggml_set_name(out, "assignments");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+             t = ggml_get_next_tensor(ctx, t)) {
+            if (t == centroids_buf) {
+                // centroids_buf 是输出 buffer，清零即可（算子会覆盖写入）
+                std::vector<uint8_t> zeros(ggml_nbytes(t), 0);
+                ggml_backend_tensor_set(t, zeros.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // ###########################################
 // ## Section 3: GGML Op Test Instantiation ##
 // ###########################################
@@ -8719,6 +8780,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+
+    // KMeans: 覆盖典型配置和边界 case
+    // (d_head, n_heads, n_tokens, n_clusters, max_iter, sink_len)
+    test_cases.emplace_back(new test_kmeans(GGML_TYPE_F16,  64, 2,  64,  4, 10, 4));
+    test_cases.emplace_back(new test_kmeans(GGML_TYPE_F16, 128, 4, 256,  8, 10, 8));
+    test_cases.emplace_back(new test_kmeans(GGML_TYPE_BF16, 64, 2,  64,  4, 10, 4));
+    test_cases.emplace_back(new test_kmeans(GGML_TYPE_BF16, 128, 4, 256,  8, 10, 8));
+
+    // 边界 case: sink_len = 0（所有 token 参与聚类）
+    test_cases.emplace_back(new test_kmeans(GGML_TYPE_F16, 32, 2, 32, 4, 5, 0));
+
+    // 边界 case: n_tokens 刚好略大于 n_clusters + sink_len（小样本聚类）
+    test_cases.emplace_back(new test_kmeans(GGML_TYPE_F16, 32, 2, 16, 4, 5, 4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

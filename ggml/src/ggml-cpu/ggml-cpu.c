@@ -2076,6 +2076,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
+            break;        case GGML_OP_KMEANS:
+            {
+                ggml_compute_forward_kmeans(params, tensor);
+            }
             break;
         case GGML_OP_NONE:
             {
@@ -2416,6 +2420,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_KMEANS:
             {
                 n_tasks = n_threads;
             } break;
@@ -2929,6 +2934,19 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_KMEANS:
+                    {
+                        const int d_head     = (int) node->src[0]->ne[0];
+                        const int n_clusters = ggml_get_op_params_i32(node, 0);
+                        const int n_tokens   = (int) node->src[0]->ne[2];
+                        cur = n_tasks * (
+                            d_head * n_tokens * sizeof(float) +                // k_f32 (dequantized K cache)
+                            d_head * n_clusters * sizeof(float) * 3 +           // centroids_cur/norm/sums
+                            n_clusters * sizeof(int) * 4 +                      // cnts/min_idx/perm/perm_inv
+                            n_tokens * sizeof(int) +                            // assignments_cur
+                            n_tokens * sizeof(float)                            // k_inv_norm
+                        );
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {

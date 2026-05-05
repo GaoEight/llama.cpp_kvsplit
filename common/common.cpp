@@ -1518,6 +1518,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    cparams.kmeans_enabled      = params.kmeans_enabled;
+    cparams.kmeans_max_iter     = params.kmeans_max_iter;
+    cparams.kmeans_cluster_div  = params.kmeans_cluster_div;
+    cparams.kmeans_sink_len     = params.kmeans_sink_len;
+
     return cparams;
 }
 

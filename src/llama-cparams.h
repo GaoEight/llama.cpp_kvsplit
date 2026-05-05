@@ -40,6 +40,11 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    bool kmeans_enabled;
+    int32_t kmeans_max_iter;
+    int32_t kmeans_cluster_div;
+    int32_t kmeans_sink_len;
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

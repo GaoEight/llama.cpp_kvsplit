@@ -986,6 +986,30 @@ static std::vector<std::string> parse_csv_row(const std::string& input) {
     return fields;
 }
 
+static void load_kmeans_config(common_params & params, const std::string & path) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        throw std::runtime_error(string_format("failed to open KMeans config: %s", path.c_str()));
+    }
+
+    nlohmann::json j;
+    try {
+        f >> j;
+    } catch (const std::exception & e) {
+        throw std::runtime_error(string_format("failed to parse KMeans config: %s", e.what()));
+    }
+
+    if (!j.contains("kmeans")) {
+        return;
+    }
+
+    auto & km = j["kmeans"];
+    if (km.contains("enabled"))       params.kmeans_enabled     = km.value("enabled", params.kmeans_enabled);
+    if (km.contains("max_iter"))      params.kmeans_max_iter    = km.value("max_iter", params.kmeans_max_iter);
+    if (km.contains("cluster_divisor")) params.kmeans_cluster_div = km.value("cluster_divisor", params.kmeans_cluster_div);
+    if (km.contains("sink_len"))      params.kmeans_sink_len    = km.value("sink_len", params.kmeans_sink_len);
+}
+
 common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
     // per-example default params
     // we define here to make sure it's included in llama-gen-docs
@@ -1353,6 +1377,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg(
+        {"--kmeans-config"}, "PATH",
+        "load KMeans configuration from JSON file (fields: enabled, max_iter, cluster_divisor, sink_len)",
+        [](common_params & params, const std::string & value) {
+            params.kmeans_config_path = value;
+            load_kmeans_config(params, value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--kmeans-enabled"},
+        {"--no-kmeans-enabled"},
+        string_format("enable KMeans clustering on KV cache (default: %s)", params.kmeans_enabled ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kmeans_enabled = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kmeans-max-iter"}, "N",
+        string_format("KMeans max iterations (default: %d)", params.kmeans_max_iter),
+        [](common_params & params, int value) {
+            params.kmeans_max_iter = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kmeans-cluster-div"}, "N",
+        string_format("KMeans cluster divisor: n_clusters = n_tokens // N (default: %d)", params.kmeans_cluster_div),
+        [](common_params & params, int value) {
+            params.kmeans_cluster_div = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kmeans-sink-len"}, "N",
+        string_format("KMeans sink token length (default: %d)", params.kmeans_sink_len),
+        [](common_params & params, int value) {
+            params.kmeans_sink_len = value;
+        }
+    ));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

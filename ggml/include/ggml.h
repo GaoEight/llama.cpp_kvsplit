@@ -576,6 +576,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_KMEANS,
 
         GGML_OP_COUNT,
     };
@@ -2404,6 +2405,21 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // KMeans clustering on K cache
+    // 参数通过 op_params 编码: [n_clusters, max_iter, sink_len]
+    //
+    // k_cache:       [d_head, n_heads, n_tokens], type F16/BF16
+    // centroids_buf: [d_head, n_heads, n_clusters], type F16 (预分配，算子写入)
+    //
+    // 返回 assignments: [n_tokens, n_heads], type I32
+    GGML_API struct ggml_tensor * ggml_kmeans(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k_cache,
+            struct ggml_tensor  * centroids_buf,
+            int32_t               n_clusters,
+            int32_t               max_iter,
+            int32_t               sink_len);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

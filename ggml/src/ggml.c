@@ -1073,9 +1073,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "KMEANS",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1183,9 +1184,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "kmeans(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5351,6 +5353,45 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kmeans(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_cache,
+        struct ggml_tensor  * centroids_buf,
+        int32_t               n_clusters,
+        int32_t               max_iter,
+        int32_t               sink_len) {
+    // 基本参数校验
+    GGML_ASSERT(n_clusters > 0);
+    GGML_ASSERT(max_iter > 0);
+    GGML_ASSERT(sink_len >= 0);
+
+    // 类型校验
+    GGML_ASSERT(k_cache->type == GGML_TYPE_F16 || k_cache->type == GGML_TYPE_BF16);
+    GGML_ASSERT(centroids_buf->type == GGML_TYPE_F16);
+
+    // shape 校验
+    GGML_ASSERT(k_cache->ne[0] == centroids_buf->ne[0]); // d_head
+    GGML_ASSERT(k_cache->ne[1] == centroids_buf->ne[1]); // n_heads
+    GGML_ASSERT(centroids_buf->ne[2] == n_clusters);
+    GGML_ASSERT(k_cache->ne[2] >= n_clusters + (int64_t)sink_len); // 有效 token 数足够
+
+    // 创建输出 assignments [n_tokens, n_heads], I32
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,
+                                                     k_cache->ne[2],  // n_tokens
+                                                     k_cache->ne[1]); // n_heads
+
+    // 编码参数到 op_params
+    ggml_set_op_params_i32(result, 0, n_clusters);
+    ggml_set_op_params_i32(result, 1, max_iter);
+    ggml_set_op_params_i32(result, 2, sink_len);
+
+    result->op     = GGML_OP_KMEANS;
+    result->src[0] = k_cache;
+    result->src[1] = centroids_buf;
 
     return result;
 }

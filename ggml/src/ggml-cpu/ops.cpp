@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 
 // ggml_compute_forward_dup
@@ -11210,5 +11211,548 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
+    }
+}
+
+// ============================================================================
+// ggml_compute_forward_kmeans — KMeans 聚类算子的 CPU 后端实现
+// ============================================================================
+//
+// 功能：对 K cache 中每个 head 的 token 向量做 KMeans 聚类。
+// 并行策略：head 按 ith/nth strip 分配到不同线程，线程间完全无共享。
+//
+// 每线程 work buffer 布局（kmeans_head 内部 carve）:
+//   centroids_cur  [d_head * n_clusters]   当前 centroid 值 (F32, cluster-major)
+//   centroids_norm [d_head * n_clusters]   L2 归一化后的 centroid (F32, d_head-major)
+//   cluster_sums   [d_head * n_clusters]   累加器: 每 cluster 的向量和
+//   cluster_cnts   [n_clusters]            每 cluster 的成员数
+//   min_idx        [n_clusters]            每 cluster 的最小 token 索引 (重编号用)
+//   perm           [n_clusters]            cluster 排序置换
+//   perm_inv       [n_clusters]            逆置换
+//   assign_cur     [n_tokens]              每 token 的当前 cluster 分配
+//
+// 两个关键内部 buffer 的 layout 设计（理解 NEON 优化的关键）:
+//
+//   centroids_cur  (cluster-major):
+//     布局: centroids_cur[c * d_head + d] = cluster c 的第 d 个元素
+//     用途: Step 2d 更新 centroid 时，需要按 cluster 遍历（对同一 cluster 的
+//           d_head 个元素连续读/写）。
+//
+//   centroids_norm (d_head-major, 即 centroids_cur 的转置):
+//     布局: centroids_norm[d * n_clusters + c] = cluster c 的第 d 个元素
+//     用途: Step 2c 分配步骤的高频 cosine similarity 计算。
+//           这种布局下，连续的 n_clusters 个 float 对应"不同 cluster 的同一维度元素"，
+//           可以用一条 NEON vld1q 指令一次加载 4 个 cluster 的 d 号元素，
+//           配合 vfmaq_f32 (向量 FMA) 同时累加 4 个 cluster 的内积。
+//
+// 图示 (d_head=4, n_clusters=3):
+//   centroids_cur  = [c0_d0, c0_d1, c0_d2, c0_d3, c1_d0, c1_d1, c1_d2, c1_d3, ...]
+//                    |--- cluster 0 ---|  |--- cluster 1 ---|
+//   centroids_norm = [c0_d0, c1_d0, c2_d0, c0_d1, c1_d1, c2_d1, c0_d2, c1_d2, c2_d2, ...]
+//                    | 同一维度 d=0, 3 个 cluster 连续  |
+
+// --------------------------------------------------------------------------
+// 标量路径: 为一个 token 找到 cosine similarity 最大的 cluster
+// --------------------------------------------------------------------------
+// centroids_norm 布局: [d_head, n_clusters]
+// 外层遍历 d_head (通常 128)，内层遍历 n_clusters (通常 ≤ 8)。
+// 每个 k_vec[d] 只加载一次，被 n_clusters 次乘法复用。
+// centroids_norm 的总大小 = d_head * n_clusters * 4B ≤ 4KB，全部在 L1 缓存中。
+static int kmeans_find_best_cluster_f32(
+        const float * k_vec,           // [d_head] — 单个 token 的 k 向量 (已 F32)
+        const float * centroids_norm,  // [d_head, n_clusters] — L2 归一化的 centroid
+        int d_head, int n_clusters,
+        float k_inv_norm) {            // 1 / |k_vec|, 将内积转换为 cosine similarity
+
+    // scores[c] = Σ_d (k_vec[d] * centroids_norm[d * n_clusters + c]) * k_inv_norm
+    //           = dot(k_vec, centroid_c) / |centroid_c| * (1 / |k_vec|)
+    //           = cosine similarity(k_vec, centroid_c)
+    float scores[GGML_KMEANS_MAX_CLUSTERS];
+    memset(scores, 0, n_clusters * sizeof(float));
+
+    // 外层遍历特征维度 d_head，内层遍历 cluster。
+    // 这样做的好处：k_vec[d] 只加载一次，用于所有 cluster 的累加，最小化内存加载。
+    for (int d = 0; d < d_head; d++) {
+        const float kv = k_vec[d];                    // k_vec 的一个标量元素
+        for (int c = 0; c < n_clusters; c++) {
+            scores[c] += kv * centroids_norm[d * n_clusters + c];
+        }
+    }
+
+    // argmax: cosine similarity 最大的 cluster 胜出
+    int best_c = 0;
+    float best_score = scores[0] * k_inv_norm;
+    for (int c = 1; c < n_clusters; c++) {
+        float score = scores[c] * k_inv_norm;
+        if (score > best_score) {
+            best_score = score;
+            best_c = c;
+        }
+    }
+    return best_c;
+}
+
+// --------------------------------------------------------------------------
+// NEON SIMD 优化路径: 为一个 token 找到 cosine similarity 最大的 cluster
+// --------------------------------------------------------------------------
+//
+// 核心思路: 标量广播 + 向量 FMA
+//
+//   标量路径中，每轮外层循环加载 k_vec[d]（1 个 float），内层循环遍历所有 cluster。
+//   NEON 的思想是：用 vdupq_n_f32 把 k_vec[d] 广播到 128-bit 寄存器的 4 个 lane，
+//   用 vld1q_f32 一次加载 4 个连续 cluster 的 d 号元素，然后用 vfmaq_f32 做一次
+//   "4 cluster × 1 k 元素" 的乘加。这样每个 d_head 元素只需要 1 次标量加载 +
+//   ceil(n_clusters/4) 次向量加载 + 等量次向量 FMA。
+//
+// 为什么不用"4 d_head × 1 cluster"的向量-向量 FMA？
+//   centroids_norm 的布局是 [d_head, n_clusters]，单个 cluster 的 d_head 个元素
+//   分散在 stride = n_clusters 的位置上，无法用一条 vld1q 加载。要改为
+//   "4 d_head × 1 cluster" 需要先对 centroids_norm 做转置，或改为 [n_clusters, d_head]
+//   布局。而广播方案不需要转置，FMA 总条数相同 (d_head × n_clusters ÷ 4)，
+//   且 centroids_norm 总共 ≤ 4KB 全在 L1 中，stride 访问代价可忽略。
+//
+// 指令详解 (n_clusters=8, d_head=128 为例):
+//   n_groups = 8 / 4 = 2 (2 组 128-bit 累加器)
+//   acc[0] 的 4 个 lane 分别累加 cluster 0,1,2,3 的内积
+//   acc[1] 的 4 个 lane 分别累加 cluster 4,5,6,7 的内积
+//
+//   每一轮 d 循环:
+//     kv_v = vdupq_n_f32(k_vec[d])           // k_vec[d] 复制 4 份 → [kv, kv, kv, kv]
+//     cv0  = vld1q_f32(&centroids[d*8 + 0])  // 加载 [c0_d, c1_d, c2_d, c3_d]
+//     cv1  = vld1q_f32(&centroids[d*8 + 4])  // 加载 [c4_d, c5_d, c6_d, c7_d]
+//     acc[0] = vfmaq_f32(acc[0], cv0, kv_v)  // lane[i] += cv0[i] * kv (i=0..3)
+//     acc[1] = vfmaq_f32(acc[1], cv1, kv_v)  // lane[i] += cv1[i] * kv (i=0..3)
+//
+//   循环结束后，acc[0] = [Σ(kv_d*c0_d), Σ(kv_d*c1_d), Σ(kv_d*c2_d), Σ(kv_d*c3_d)]
+//   = [dot(k_vec, cent_0), dot(k_vec, cent_1), dot(k_vec, cent_2), dot(k_vec, cent_3)]
+//
+// FMA 指令数分析 (d_head=128, n_clusters=8):
+//   128 d_iter × 2 groups = 256 条 FMAs / token
+//   标量等价: 128 × 8 = 1024 mul + ~896 add ≈ 1920 条指令
+//   理论加速: ~7.5× (仅算术指令，不含加载)
+//
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+
+static int kmeans_find_best_cluster_neon(
+        const float * k_vec,
+        const float * centroids_norm,
+        int d_head, int n_clusters,
+        float k_inv_norm) {
+
+    // 每 4 个 cluster 分为一组，用 1 个 float32x4_t 累加器处理
+    const int n_groups = n_clusters / 4;     // 完整的 4-cluster 组数
+    const int n_rem    = n_clusters % 4;     // 剩余不足 4 个的 cluster（末尾标量处理）
+
+    // 累加器数组: 每组 4 个 cluster 一个 float32x4_t
+    float32x4_t acc[GGML_KMEANS_MAX_CLUSTERS / 4];
+
+    // 累加器清零
+    for (int g = 0; g < n_groups; g++) {
+        acc[g] = vdupq_n_f32(0.0f);   // 4 个 lane 全部置 0
+    }
+
+    // 主循环: 遍历 d_head，每次处理 1 个 k 元素 × 4 个 cluster
+    for (int d = 0; d < d_head; d++) {
+        // 将 k_vec[d] 这个标量复制到 float32x4_t 的 4 个 lane
+        const float32x4_t kv_v = vdupq_n_f32(k_vec[d]);
+
+        for (int g = 0; g < n_groups; g++) {
+            // 加载 4 个连续 cluster 在维度 d 的值
+            // centroids_norm 布局为 [d_head, n_clusters]，
+            // &centroids_norm[d * n_clusters + g * 4] 正好是 4 个连续 cluster
+            const float32x4_t cv = vld1q_f32(&centroids_norm[d * n_clusters + g * 4]);
+
+            // FMA: acc[g][lane] += cv[lane] * kv_v[lane]
+            // kv_v 的 4 个 lane 全部相同 (= k_vec[d])，所以实际效果是
+            // acc[g][lane] += cv[lane] * k_vec[d]
+            acc[g] = vfmaq_f32(acc[g], cv, kv_v);
+        }
+    }
+
+    // 将 NEON 寄存器中的累加结果提取到标量数组
+    float scores[GGML_KMEANS_MAX_CLUSTERS];
+    for (int g = 0; g < n_groups; g++) {
+        vst1q_f32(&scores[g * 4], acc[g]);   // 存 4 个 float 到连续内存
+    }
+
+    // 剩余不足 4 个的 cluster 用标量路径补齐
+    for (int c = n_groups * 4; c < n_clusters; c++) {
+        float s = 0.0f;
+        for (int d = 0; d < d_head; d++) {
+            s += k_vec[d] * centroids_norm[d * n_clusters + c];
+        }
+        scores[c] = s;
+    }
+
+    // argmax: 找 cosine similarity 最大的 cluster
+    int best_c = 0;
+    float best_score = scores[0] * k_inv_norm;
+    for (int c = 1; c < n_clusters; c++) {
+        float score = scores[c] * k_inv_norm;
+        if (score > best_score) {
+            best_score = score;
+            best_c = c;
+        }
+    }
+    return best_c;
+}
+#endif // __ARM_NEON
+
+// --------------------------------------------------------------------------
+// kmeans_head — 对单个 head 执行完整 KMeans 聚类
+// --------------------------------------------------------------------------
+// 参数说明:
+//   k_f32:         [d_head, n_tokens]  该 head 全部 token 的 k 向量 (已反量化到 F32)
+//   centroids_out: 输出 centroid 的 F16 buffer, cluster 间 stride 为 stride_c
+//   stride_c:      centroids_out 中相邻 cluster 的间距 (fp16 单位)
+//                  = centroids_buf->nb[2] / sizeof(ggml_fp16_t) = d_head * n_heads
+//   assignments:   [n_tokens] 输出, 每 token 的 cluster 编号 (sink 部分 = -1)
+//   wbuf:          本线程的 work buffer (布局见文件头注释)
+//
+// 内部 layout 设计 (理解 NEON 优化的关键):
+//
+//   centroids_cur  [d_head * n_clusters], cluster-major (c 连续):
+//     centroids_cur[c * d_head + d] = cluster c 的第 d 个元素
+//     用于 Step 2d (更新): 按 cluster 遍历，连续读/写 d_head 个元素
+//
+//   centroids_norm [d_head * n_clusters], d_head-major (d 连续):
+//     centroids_norm[d * n_clusters + c] = cluster c 的第 d 个元素 (L2 归一化后)
+//     用于 Step 2c (分配): 外层遍历 d，内层遍历 cluster
+//     这种布局让"4 个连续 cluster 在同一维度 d 的值"在内存中连续，
+//     可以用一条 NEON vld1q 加载，配合 vfmaq 同时累加 4 个 cluster 的内积
+//
+static void kmeans_head(
+        const float * k_f32,           // [d_head, n_tokens]
+        ggml_fp16_t * centroids_out,   // 输出 centroid (F16), cluster 间 stride = stride_c
+        int           stride_c,        // centroids_out 中相邻 cluster 的间距 (fp16 单位)
+        int32_t     * assignments,     // [n_tokens], 输出 cluster 编号
+        int d_head, int n_tokens, int n_clusters,
+        int max_iter, int sink_len,
+        float * wbuf) {
+
+    const int n_eff = n_tokens - sink_len;  // 实际参与聚类的 token 数
+
+    // ---- 从 work buffer 中切分出各子 buffer ----
+    // layout 见文件头注释
+    float * centroids_cur  = wbuf;
+    float * centroids_norm = centroids_cur  + d_head * n_clusters;
+    float * cluster_sums   = centroids_norm + d_head * n_clusters;
+    int   * cluster_cnts   = (int *)(cluster_sums   + d_head * n_clusters);
+    int   * min_idx        = cluster_cnts + n_clusters;
+    int   * perm           = min_idx      + n_clusters;
+    int   * perm_inv       = perm         + n_clusters;
+    int   * assign_cur     = perm_inv     + n_clusters;
+    float * k_inv_norm     = (float *)(assign_cur + n_tokens);
+
+    // =====================================================================
+    // Step 1: 均匀采样初始化 centroid
+    // =====================================================================
+    // 在 sink 之后的 token 中，按等间距选取 n_clusters 个向量作为初始 centroid。
+    // 例: 100 个 token (sink=4, n_eff=96), n_clusters=8
+    //     取 idx = 4, 16, 28, 40, 52, 64, 76, 88
+    memset(centroids_cur, 0, d_head * n_clusters * sizeof(float));
+    for (int c = 0; c < n_clusters; c++) {
+        const int src_idx = sink_len + (c * n_eff) / n_clusters;
+        memcpy(centroids_cur + c * d_head,           // dst: centroids_cur, cluster c
+               k_f32 + src_idx * d_head,              // src: k_f32 中 token src_idx
+               d_head * sizeof(float));
+    }
+
+    // ---- 预计算每个 token 的 k_inv_norm (1 / |k_vec|) ----
+    // cosine similarity = dot(k, c) / (|k| * |c|)
+    // 由于 centroid 已归一化 (|c| = 1)，只需乘以 1/|k| 即可将内积转为 cosine
+    for (int t = sink_len; t < n_tokens; t++) {
+        const float * kv = k_f32 + t * d_head;
+        float sum_sq = 0.0f;
+        for (int d = 0; d < d_head; d++) {
+            sum_sq += kv[d] * kv[d];
+        }
+        k_inv_norm[t] = (sum_sq > 0.0f) ? (1.0f / sqrtf(sum_sq)) : 1.0f;
+    }
+    for (int t = 0; t < sink_len; t++) {
+        k_inv_norm[t] = 1.0f;  // sink token 不参与，设为 1 避免未初始化
+    }
+
+    // =====================================================================
+    // Step 2: KMeans 迭代 (max_iter 轮，不提前停止)
+    // =====================================================================
+    for (int iter = 0; iter < max_iter; iter++) {
+        // 2a. 对 centroids_cur 做 L2 归一化，存入 centroids_norm
+        //     同时完成"转置": centroids_cur[c*d_head + d] → centroids_norm[d*n_clusters + c]
+        //     预归一化的目的是让分配步骤只做内积，再乘以 k_inv_norm 即得 cosine similarity
+        for (int c = 0; c < n_clusters; c++) {
+            // 计算 L2 norm
+            float sum_sq = 0.0f;
+            for (int d = 0; d < d_head; d++) {
+                const float v = centroids_cur[c * d_head + d];
+                sum_sq += v * v;
+            }
+            const float inv_norm = (sum_sq > 0.0f) ? (1.0f / sqrtf(sum_sq)) : 1.0f;
+            // 归一化并转置: cluster-major → d_head-major
+            for (int d = 0; d < d_head; d++) {
+                centroids_norm[d * n_clusters + c] = centroids_cur[c * d_head + d] * inv_norm;
+            }
+        }
+
+        // 2b. 清零累加器
+        memset(cluster_sums, 0, d_head * n_clusters * sizeof(float));
+        memset(cluster_cnts, 0, n_clusters * sizeof(int));
+
+        // 2c. 分配步骤: 每个 token 分配到 cosine similarity 最大的 cluster
+        //     按 CHUNK_SIZE 分块遍历 token，提高 cache 局部性
+        for (int t_start = sink_len; t_start < n_tokens; t_start += GGML_KMEANS_CHUNK_SIZE) {
+            const int t_end = MIN(t_start + GGML_KMEANS_CHUNK_SIZE, n_tokens);
+
+            for (int t = t_start; t < t_end; t++) {
+                const float * k_vec = k_f32 + t * d_head;  // token t 的 k 向量
+
+                // 根据编译目标选择标量或 NEON 路径
+#ifdef __ARM_NEON
+                const int best_c = kmeans_find_best_cluster_neon(k_vec, centroids_norm, d_head, n_clusters, k_inv_norm[t]);
+#else
+                const int best_c = kmeans_find_best_cluster_f32(k_vec, centroids_norm, d_head, n_clusters, k_inv_norm[t]);
+#endif
+
+                assign_cur[t] = best_c;
+                cluster_cnts[best_c]++;
+
+                // 将 token 的 k 向量累加到其所属 cluster 的 sum 中 (用于下一步更新 centroid)
+                float * sum_dst = cluster_sums + best_c * d_head;
+                for (int d = 0; d < d_head; d++) {
+                    sum_dst[d] += k_vec[d];
+                }
+            }
+        }
+
+        // 2d. 更新 centroid: 每 cluster 的新 centroid = 该 cluster 成员向量的均值
+        //     空 cluster 保持旧 centroid 不变 (设计文档规定)
+        for (int c = 0; c < n_clusters; c++) {
+            if (cluster_cnts[c] > 0) {
+                const float inv_cnt = 1.0f / (float) cluster_cnts[c];
+                for (int d = 0; d < d_head; d++) {
+                    centroids_cur[c * d_head + d] = cluster_sums[c * d_head + d] * inv_cnt;
+                }
+            }
+            // else: 空 cluster, 保持上一次迭代的 centroid 值不变
+        }
+    }
+
+    // =====================================================================
+    // Step 3: 按最小 token 索引对 cluster 重编号
+    // =====================================================================
+    // 目标: 让 cluster 0 包含"最早出现"的 token, cluster 1 次早, 以此类推。
+    // 做法: 找到每个 cluster 的最小 token 索引 → 按此索引升序排列 cluster
+
+    // 3a. 找每个 cluster 的最小 token 索引
+    for (int c = 0; c < n_clusters; c++) {
+        min_idx[c] = INT_MAX;
+    }
+    for (int t = sink_len; t < n_tokens; t++) {
+        const int c = assign_cur[t];
+        if (t < min_idx[c]) {
+            min_idx[c] = t;
+        }
+    }
+
+    // 3b. 按 min_idx 升序对 cluster 编号排序 → perm (选择排序, n_clusters 很小)
+    for (int c = 0; c < n_clusters; c++) {
+        perm[c] = c;
+    }
+    for (int i = 0; i < n_clusters; i++) {
+        for (int j = i + 1; j < n_clusters; j++) {
+            if (min_idx[perm[i]] > min_idx[perm[j]]) {
+                const int tmp = perm[i];
+                perm[i] = perm[j];
+                perm[j] = tmp;
+            }
+        }
+    }
+
+    // 3c. 计算逆置换: perm_inv[原编号] = 新编号
+    for (int c = 0; c < n_clusters; c++) {
+        perm_inv[perm[c]] = c;
+    }
+
+    // =====================================================================
+    // Step 4: 写回输出 (带重编号)
+    // =====================================================================
+    // assignments: sink 之前的 token 标记为 -1; 其余用重编号后的 cluster ID
+    for (int t = 0; t < sink_len; t++) {
+        assignments[t] = -1;
+    }
+    for (int t = sink_len; t < n_tokens; t++) {
+        assignments[t] = perm_inv[assign_cur[t]];
+    }
+
+    // centroids: F32 → F16, 按 perm 指定的顺序写回
+    // centroids_out 是 GGML 3D tensor [d_head, n_heads, n_clusters] 中 head h 的切片,
+    // cluster 之间的 stride 不是 n_clusters 而是 stride_c (= d_head * n_heads)
+    for (int c = 0; c < n_clusters; c++) {
+        const int src_c = perm[c];  // 新 cluster c 对应的原始 cluster 编号
+        for (int d = 0; d < d_head; d++) {
+            centroids_out[d + c * stride_c] = GGML_FP32_TO_FP16(
+                centroids_cur[src_c * d_head + d]);
+        }
+    }
+}
+
+// ==========================================================================
+// 按 k_cache 类型分派: F16 版本
+// ==========================================================================
+// 流程:
+//   1. 从 GGML tensor 和 op_params 解码参数
+//   2. 计算每线程 work buffer 大小, 从 params->wdata 中切分
+//   3. 分配临时 k_f32 buffer (整个 head 的 K cache 反量化到 F32, 后续可优化为 chunked)
+//   4. 按 ith/nth strip 分配 head, 每个线程独立处理自己的 head 集合
+//   5. 对每个 head: 反量化 k_cache → 调用 kmeans_head → 释放
+//
+// 内存开销 (d_head=128, n_tokens=32K):
+//   k_f32 (per-head, 复用):     16 MB
+//   wbuf (per-thread):         ~268 KB
+//   centroids_out (per-head):    2 KB (F16)
+//   assignments (per-head):   128 KB (I32)
+//
+static void ggml_compute_forward_kmeans_f16(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * k_cache       = dst->src[0];
+    const struct ggml_tensor * centroids_buf = dst->src[1];
+
+    // 从 tensor shape 和 op_params 解码参数
+    const int d_head     = (int) k_cache->ne[0];
+    const int n_heads    = (int) k_cache->ne[1];
+    const int n_tokens   = (int) k_cache->ne[2];
+    const int n_clusters = ggml_get_op_params_i32(dst, 0);
+    const int max_iter   = ggml_get_op_params_i32(dst, 1);
+    const int sink_len   = ggml_get_op_params_i32(dst, 2);
+
+    const int ith = params->ith;  // 当前线程编号 (0-indexed)
+    const int nth = params->nth;  // 总线程数
+
+    // 每个线程独立 work buffer 的大小
+    const size_t per_thread_size =
+        d_head * n_tokens * sizeof(float) +                // k_f32 (dequantized K cache)
+        d_head * n_clusters * sizeof(float) * 3 +           // centroids_cur + centroids_norm + cluster_sums
+        n_clusters * sizeof(int) * 4 +                      // cluster_cnts + min_idx + perm + perm_inv
+        n_tokens * sizeof(int) +                            // assign_cur
+        n_tokens * sizeof(float);                           // k_inv_norm
+
+    // 从 ggml 统一分配的 work buffer 中切出本线程的部分
+    // layout: [k_f32][wbuf(centroids/sums/cnts.../assign_cur/k_inv_norm)]
+    float * base = (float *) ((char *) params->wdata + per_thread_size * ith);
+    float * k_f32 = base;
+    float * wbuf  = (float *) ((char *) k_f32 + d_head * n_tokens * sizeof(float));
+
+    // 按 stripe 分配 head: 线程 ith 处理 head [ith, ith+nth, ith+2*nth, ...]
+    for (int h = ith; h < n_heads; h += nth) {
+        // 定位 k_cache 中 head h 的数据起始位置
+        // k_cache 布局: [d_head, n_heads, n_tokens], F16
+        // head h 起始偏移 = h * nb[1], 每 token 间距 = nb[2]
+        const ggml_fp16_t * head_src = (const ggml_fp16_t *)
+            ((const char *) k_cache->data + h * k_cache->nb[1]);
+
+        // 将该 head 的所有 token 从 F16 反量化到 F32
+        for (int t = 0; t < n_tokens; t++) {
+            ggml_fp16_to_fp32_row(
+                head_src + t * (k_cache->nb[2] / sizeof(ggml_fp16_t)),
+                k_f32 + t * d_head,
+                d_head);
+        }
+
+        // 定位输出 buffer 中 head h 的位置
+        ggml_fp16_t * centroids_head = (ggml_fp16_t *)
+            ((char *) centroids_buf->data + h * centroids_buf->nb[1]);
+
+        int32_t * assign_head = (int32_t *)
+            ((char *) dst->data + h * dst->nb[1]);
+
+        // centroids_buf 是 3D tensor [d_head, n_heads, n_clusters],
+        // head 内 cluster 维度的 stride = nb[2]/sizeof(fp16) = d_head * n_heads
+        const int stride_c = (int) (centroids_buf->nb[2] / sizeof(ggml_fp16_t));
+
+        kmeans_head(k_f32, centroids_head, stride_c, assign_head,
+                    d_head, n_tokens, n_clusters,
+                    max_iter, sink_len, wbuf);
+    }
+}
+
+// ==========================================================================
+// 按 k_cache 类型分派: BF16 版本
+// ==========================================================================
+// 与 F16 版本结构完全一致, 唯一区别是反量化调用 ggml_bf16_to_fp32_row
+static void ggml_compute_forward_kmeans_bf16(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * k_cache       = dst->src[0];
+    const struct ggml_tensor * centroids_buf = dst->src[1];
+
+    const int d_head     = (int) k_cache->ne[0];
+    const int n_heads    = (int) k_cache->ne[1];
+    const int n_tokens   = (int) k_cache->ne[2];
+    const int n_clusters = ggml_get_op_params_i32(dst, 0);
+    const int max_iter   = ggml_get_op_params_i32(dst, 1);
+    const int sink_len   = ggml_get_op_params_i32(dst, 2);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const size_t per_thread_size =
+        d_head * n_tokens * sizeof(float) +
+        d_head * n_clusters * sizeof(float) * 3 +
+        n_clusters * sizeof(int) * 4 +
+        n_tokens * sizeof(int) +
+        n_tokens * sizeof(float);
+
+    float * base = (float *) ((char *) params->wdata + per_thread_size * ith);
+    float * k_f32 = base;
+    float * wbuf  = (float *) ((char *) k_f32 + d_head * n_tokens * sizeof(float));
+
+    for (int h = ith; h < n_heads; h += nth) {
+        // 与 F16 版本的唯一区别: 使用 BF16 反量化
+        const ggml_bf16_t * head_src = (const ggml_bf16_t *)
+            ((const char *) k_cache->data + h * k_cache->nb[1]);
+
+        for (int t = 0; t < n_tokens; t++) {
+            ggml_bf16_to_fp32_row(
+                head_src + t * (k_cache->nb[2] / sizeof(ggml_bf16_t)),
+                k_f32 + t * d_head,
+                d_head);
+        }
+
+        ggml_fp16_t * centroids_head = (ggml_fp16_t *)
+            ((char *) centroids_buf->data + h * centroids_buf->nb[1]);
+
+        int32_t * assign_head = (int32_t *)
+            ((char *) dst->data + h * dst->nb[1]);
+
+        const int stride_c = (int) (centroids_buf->nb[2] / sizeof(ggml_fp16_t));
+
+        kmeans_head(k_f32, centroids_head, stride_c, assign_head,
+                    d_head, n_tokens, n_clusters,
+                    max_iter, sink_len, wbuf);
+    }
+}
+
+// ==========================================================================
+// 主入口: 按 k_cache 类型分派到 F16 或 BF16 实现
+// ==========================================================================
+void ggml_compute_forward_kmeans(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * k_cache = dst->src[0];
+
+    switch (k_cache->type) {
+        case GGML_TYPE_F16:
+            ggml_compute_forward_kmeans_f16(params, dst);
+            break;
+        case GGML_TYPE_BF16:
+            ggml_compute_forward_kmeans_bf16(params, dst);
+            break;
+        default:
+            GGML_ABORT("kmeans: unsupported k_cache type");
     }
 }

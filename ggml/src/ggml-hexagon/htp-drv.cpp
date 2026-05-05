@@ -9,12 +9,12 @@
 #include <sstream>
 #include <string>
 #ifdef _WIN32
-#   define WIN32_LEAN_AND_MEAN
-#   ifndef NOMINMAX
-#       define NOMINMAX
-#   endif
-#   include <windows.h>
-#   include <winevt.h>
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#    include <winevt.h>
 #else
 #    include <dlfcn.h>
 #    include <unistd.h>
@@ -31,8 +31,8 @@
 
 typedef void * (*rpcmem_alloc_pfn_t)(int heapid, uint32_t flags, int size);
 typedef void * (*rpcmem_alloc2_pfn_t)(int heapid, uint32_t flags, size_t size);
-typedef void   (*rpcmem_free_pfn_t)(void * po);
-typedef int    (*rpcmem_to_fd_pfn_t)(void * po);
+typedef void (*rpcmem_free_pfn_t)(void * po);
+typedef int (*rpcmem_to_fd_pfn_t)(void * po);
 
 typedef AEEResult (*dspqueue_create_pfn_t)(int                 domain,
                                            uint32_t            flags,
@@ -43,29 +43,34 @@ typedef AEEResult (*dspqueue_create_pfn_t)(int                 domain,
                                            void *              callback_context,
                                            dspqueue_t *        queue);
 typedef AEEResult (*dspqueue_close_pfn_t)(dspqueue_t queue);
-typedef AEEResult (*dspqueue_export_pfn_t)(dspqueue_t queue, uint64_t *queue_id);
-typedef AEEResult (*dspqueue_write_pfn_t)(dspqueue_t queue, uint32_t flags,
-                                          uint32_t num_buffers,
-                                          struct dspqueue_buffer *buffers,
-                                          uint32_t message_length,
-                                          const uint8_t *message,
-                                          uint32_t timeout_us);
-typedef AEEResult (*dspqueue_read_pfn_t)(dspqueue_t queue, uint32_t *flags,
-                                         uint32_t max_buffers, uint32_t *num_buffers,
-                                         struct dspqueue_buffer *buffers,
-                                         uint32_t max_message_length,
-                                         uint32_t *message_length, uint8_t *message,
-                                         uint32_t timeout_us);
+typedef AEEResult (*dspqueue_export_pfn_t)(dspqueue_t queue, uint64_t * queue_id);
+typedef AEEResult (*dspqueue_write_pfn_t)(dspqueue_t               queue,
+                                          uint32_t                 flags,
+                                          uint32_t                 num_buffers,
+                                          struct dspqueue_buffer * buffers,
+                                          uint32_t                 message_length,
+                                          const uint8_t *          message,
+                                          uint32_t                 timeout_us);
+typedef AEEResult (*dspqueue_read_pfn_t)(dspqueue_t               queue,
+                                         uint32_t *               flags,
+                                         uint32_t                 max_buffers,
+                                         uint32_t *               num_buffers,
+                                         struct dspqueue_buffer * buffers,
+                                         uint32_t                 max_message_length,
+                                         uint32_t *               message_length,
+                                         uint8_t *                message,
+                                         uint32_t                 timeout_us);
 
-typedef int (*fastrpc_mmap_pfn_t)(int domain, int fd, void *addr, int offset, size_t length, enum fastrpc_map_flags flags);
-typedef int (*fastrpc_munmap_pfn_t)(int domain, int fd, void *addr, size_t length);
+typedef int (
+    *fastrpc_mmap_pfn_t)(int domain, int fd, void * addr, int offset, size_t length, enum fastrpc_map_flags flags);
+typedef int (*fastrpc_munmap_pfn_t)(int domain, int fd, void * addr, size_t length);
 
-typedef int (*remote_handle64_open_pfn_t)(const char* name, remote_handle64 *ph);
-typedef int (*remote_handle64_invoke_pfn_t)(remote_handle64 h, uint32_t dwScalars, remote_arg *pra);
+typedef int (*remote_handle64_open_pfn_t)(const char * name, remote_handle64 * ph);
+typedef int (*remote_handle64_invoke_pfn_t)(remote_handle64 h, uint32_t dwScalars, remote_arg * pra);
 typedef int (*remote_handle64_close_pfn_t)(remote_handle h);
-typedef int (*remote_handle_control_pfn_t)(uint32_t req, void* data, uint32_t datalen);
-typedef int (*remote_handle64_control_pfn_t)(remote_handle64 h, uint32_t req, void* data, uint32_t datalen);
-typedef int (*remote_session_control_pfn_t)(uint32_t req, void *data, uint32_t datalen);
+typedef int (*remote_handle_control_pfn_t)(uint32_t req, void * data, uint32_t datalen);
+typedef int (*remote_handle64_control_pfn_t)(remote_handle64 h, uint32_t req, void * data, uint32_t datalen);
+typedef int (*remote_session_control_pfn_t)(uint32_t req, void * data, uint32_t datalen);
 
 //
 // Driver API pfns
@@ -199,19 +204,16 @@ static std::string wstr_to_str(std::wstring_view wstr) {
     if (wstr.empty()) {
         return result;
     }
-    auto bytes_needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-                                            wstr.data(), (int) wstr.size(),
-                                            nullptr, 0, nullptr, nullptr);
+    auto bytes_needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wstr.data(), (int) wstr.size(), nullptr, 0,
+                                            nullptr, nullptr);
     if (bytes_needed == 0) {
         GGML_LOG_ERROR("ggml-hex: WideCharToMultiByte failed. Error %lu\n", GetLastError());
         throw std::runtime_error("Invalid wstring input");
     }
 
     result.resize(bytes_needed, '\0');
-    int bytes_written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-                                            wstr.data(), (int) wstr.size(),
-                                            result.data(), bytes_needed,
-                                            nullptr, nullptr);
+    int bytes_written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wstr.data(), (int) wstr.size(),
+                                            result.data(), bytes_needed, nullptr, nullptr);
     if (bytes_written == 0) {
         GGML_LOG_ERROR("ggml-hex: WideCharToMultiByte failed. Error %lu\n", GetLastError());
         throw std::runtime_error("Wstring conversion failed");
@@ -221,7 +223,7 @@ static std::string wstr_to_str(std::wstring_view wstr) {
 
 static std::string get_driver_path() {
     std::wstring serviceName = L"qcnspmcdm";
-    std::string result;
+    std::string  result;
 
     // Get a handle to the SCM database.
     SC_HANDLE schSCManager = OpenSCManagerW(NULL, NULL, STANDARD_RIGHTS_READ);
@@ -243,16 +245,14 @@ static std::string get_driver_path() {
 
     // Store the size of buffer used as an output.
     DWORD bufferSize;
-    if (!QueryServiceConfigW(schService, NULL, 0, &bufferSize) &&
-        (GetLastError() != ERROR_INSUFFICIENT_BUFFER)) {
+    if (!QueryServiceConfigW(schService, NULL, 0, &bufferSize) && (GetLastError() != ERROR_INSUFFICIENT_BUFFER)) {
         GGML_LOG_ERROR("ggml-hex: Failed to query service config. Error: %lu\n", GetLastError());
         CloseServiceHandle(schService);
         CloseServiceHandle(schSCManager);
         return result;
     }
     // Get the configuration of the service.
-    LPQUERY_SERVICE_CONFIGW serviceConfig =
-        static_cast<LPQUERY_SERVICE_CONFIGW>(LocalAlloc(LMEM_FIXED, bufferSize));
+    LPQUERY_SERVICE_CONFIGW serviceConfig = static_cast<LPQUERY_SERVICE_CONFIGW>(LocalAlloc(LMEM_FIXED, bufferSize));
     if (!QueryServiceConfigW(schService, serviceConfig, bufferSize, &bufferSize)) {
         fprintf(stderr, "ggml-hex: Failed to query service config. Error: %lu\n", GetLastError());
         LocalFree(serviceConfig);
@@ -263,7 +263,7 @@ static std::string get_driver_path() {
 
     // Read the driver file path get its parent directory
     std::wstring driverPath = std::wstring(serviceConfig->lpBinaryPathName);
-    driverPath = driverPath.substr(0, driverPath.find_last_of(L"\\"));
+    driverPath              = driverPath.substr(0, driverPath.find_last_of(L"\\"));
 
     // Clean up resources
     LocalFree(serviceConfig);
@@ -307,7 +307,7 @@ using dl_handle_ptr = std::unique_ptr<dl_handle, dl_handle_deleter>;
 
 int htpdrv_init() {
     static dl_handle_ptr lib_cdsp_rpc_handle = nullptr;
-    static bool initialized = false;
+    static bool          initialized         = false;
 #ifdef _WIN32
     std::string drv_path = get_driver_path() + "\\" + "libcdsprpc.dll";
 #else
@@ -319,20 +319,20 @@ int htpdrv_init() {
     }
     GGML_LOG_INFO("ggml-hex: Loading driver %s\n", drv_path.c_str());
 
-    fs::path path{ drv_path.c_str() };
-    dl_handle_ptr handle { dl_load_library(path) };
+    fs::path      path{ drv_path.c_str() };
+    dl_handle_ptr handle{ dl_load_library(path) };
     if (!handle) {
         GGML_LOG_ERROR("ggml-hex: failed to load %s: %s\n", path.u8string().c_str(), dl_error());
         return AEE_EUNABLETOLOAD;
     }
 
-#define dlsym(drv, type, pfn, symbol, ignore)                               \
-    do {                                                                    \
-        pfn = (type) dl_get_sym(drv, #symbol);                              \
-        if (!ignore && nullptr == pfn) {                                    \
-            GGML_LOG_ERROR("ggml-hex: failed to dlsym %s\n", #symbol);      \
-            return AEE_EUNABLETOLOAD;                                       \
-        }                                                                   \
+#define dlsym(drv, type, pfn, symbol, ignore)                          \
+    do {                                                               \
+        pfn = (type) dl_get_sym(drv, #symbol);                         \
+        if (!ignore && nullptr == pfn) {                               \
+            GGML_LOG_ERROR("ggml-hex: failed to dlsym %s\n", #symbol); \
+            return AEE_EUNABLETOLOAD;                                  \
+        }                                                              \
     } while (0)
 
     dlsym(handle.get(), rpcmem_alloc_pfn_t, rpcmem_alloc_pfn, rpcmem_alloc, false);

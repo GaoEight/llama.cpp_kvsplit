@@ -1,0 +1,23 @@
+{
+    "name": "llama.cpp Hexagon",
+    "image": "my-android-dev:v1",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "workspaceFolder": "/workspace",
+    "remoteEnv": {
+        "PATH": "/opt/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin:${containerEnv:PATH}"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cmake-tools",
+                "llvm-vs-code-extensions.vscode-clangd"
+            ],
+            "settings": {
+                "cmake.configureOnOpen": false,
+                "clangd.path": "/opt/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin/clangd",
+                "C_Cpp.clang_format_path": "/opt/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin/clang-format"
+            }
+        }
+    }
+}
